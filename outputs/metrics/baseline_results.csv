@@ -1,0 +1,9 @@
+model,MAE,RMSE,MAPE,R2
+Naive day-ahead 24h,0.4867,0.7393,63.62,-0.106
+Moving Average day-ahead 24h,0.5518,0.699,92.08,0.0112
+Linear Regression day-ahead 24h,0.4456,0.6031,62.39,0.2639
+XGBoost day-ahead 24h,0.4049,0.564,56.78,0.3564
+XGBoost refit train+val 24h,0.4019,0.5625,55.98,0.3598
+LightGBM day-ahead 24h,0.3997,0.5999,45.85,0.2718
+XGBoost direct horizon 24h,0.4106,0.5652,60.2,0.3536
+LightGBM per-horizon 24h,0.397,0.5731,52.2,0.3352

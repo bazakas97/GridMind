@@ -1,0 +1,7 @@
+# Optional neural forecasting stack.
+#
+# Install this in a separate virtual environment. Recent Darts releases require
+# newer numpy/pandas/scikit-learn versions than the dashboard environment uses.
+pytorch-lightning
+u8darts[torch]
+chronos-forecasting

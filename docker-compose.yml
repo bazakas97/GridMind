@@ -1,0 +1,12 @@
+services:
+  gridmind:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gridmind:latest
+    container_name: gridmind
+    ports:
+      - "8501:8501"
+    restart: always
+    environment:
+      - TZ=Europe/Athens

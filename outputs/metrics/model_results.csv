@@ -1,0 +1,4 @@
+model,MAE,RMSE,MAPE,R2,input_hours,covered_hours,model_path,epoch_log_path
+N-HiTS compact lags MAE 168h,0.4136,0.5827,55.6,0.3128,168,5160,/home/chbazakas/Documents/GridMind/outputs/models/nhits_compact_lags_mae_168h.pt,/home/chbazakas/Documents/GridMind/outputs/metrics/epochs_nhits_compact_lags_mae_168h.csv
+TFT known covariates 168h,0.4137,0.6168,50.16,0.2301,168,5160,/home/chbazakas/Documents/GridMind/outputs/models/tft_known_covs_168h.pt,/home/chbazakas/Documents/GridMind/outputs/metrics/epochs_tft_known_covs_168h.csv
+N-BEATS 168h,0.414,0.5992,52.6,0.2734,168,5160,/home/chbazakas/Documents/GridMind/outputs/models/nbeats_168h.pt,/home/chbazakas/Documents/GridMind/outputs/metrics/epochs_nbeats_168h.csv
