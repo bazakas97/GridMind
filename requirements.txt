@@ -4,5 +4,3 @@ scipy
 matplotlib
 plotly
 streamlit
-gymnasium
-stable-baselines3[extra]
