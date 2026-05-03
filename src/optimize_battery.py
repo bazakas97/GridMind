@@ -397,6 +397,201 @@ def optimize_battery_rolling_horizon(forecast_kw: np.ndarray,
     return result
 
 
+def optimize_battery_mpc(forecast_kw: np.ndarray,
+                         forecast_prices: np.ndarray,
+                         actual_kw: np.ndarray | None = None,
+                         actual_prices: np.ndarray | None = None,
+                         horizon_hours: int = 6,
+                         config: BatteryConfig | None = None) -> dict:
+    """
+    Model Predictive Control: re-optimise every hour using a short lookahead.
+    More realistic than day-ahead LP — the agent only sees `horizon_hours` ahead.
+    """
+    return optimize_battery_rolling_horizon(
+        forecast_kw,
+        forecast_prices,
+        actual_kw=actual_kw,
+        actual_prices=actual_prices,
+        horizon_hours=horizon_hours,
+        step_hours=1,
+        config=config,
+    )
+
+
+def optimize_battery_stochastic(forecast_kw: np.ndarray,
+                                 forecast_prices: np.ndarray,
+                                 actual_kw: np.ndarray | None = None,
+                                 actual_prices: np.ndarray | None = None,
+                                 n_scenarios: int = 30,
+                                 price_noise_std: float | None = None,
+                                 config: BatteryConfig | None = None) -> dict:
+    """
+    Stochastic LP (Sample Average Approximation):
+      1. Generate N price scenarios by perturbing the forecast with historical noise.
+      2. Solve LP for each scenario.
+      3. Average the charge schedules → robust plan that hedges uncertainty.
+    """
+    config = config or DEFAULT_BATTERY_CONFIG
+    forecast_kw     = np.asarray(forecast_kw,     dtype=float)
+    forecast_prices = np.asarray(forecast_prices, dtype=float)
+
+    # Estimate noise std from forecast prices (±15 % of mean if no history)
+    if price_noise_std is None:
+        price_noise_std = max(float(np.std(forecast_prices)) * 0.5, float(np.mean(np.abs(forecast_prices))) * 0.15)
+
+    rng = np.random.default_rng(42)
+    charge_plans = []
+    for _ in range(n_scenarios):
+        noise         = rng.normal(0, price_noise_std, size=len(forecast_prices))
+        scenario      = np.clip(forecast_prices + noise, 0.001, None)
+        res           = optimize_battery_lp(forecast_kw, scenario,
+                                            require_terminal_soc=False, config=config)
+        if res.get("success", False):
+            charge_plans.append(res["charge"])
+
+    if not charge_plans:
+        return {"success": False, "message": "All SAA scenarios failed"}
+
+    avg_charge = np.mean(charge_plans, axis=0)
+    realized   = realize_schedule(
+        actual_kw if actual_kw is not None else forecast_kw,
+        avg_charge,
+        config=config,
+    )
+
+    ap = actual_prices if actual_prices is not None else forecast_prices
+    r_costs = cost_summary(
+        actual_kw if actual_kw is not None else forecast_kw,
+        realized["realized_grid_draw"],
+        np.asarray(ap, dtype=float),
+    )
+    soc = np.zeros(len(avg_charge) + 1)
+    soc[0] = config.capacity_kwh * config.initial_soc
+    for t, c in enumerate(avg_charge):
+        if c >= 0:
+            soc[t + 1] = soc[t] + c * config.charge_efficiency
+        else:
+            soc[t + 1] = soc[t] - (-c) / config.discharge_efficiency
+        soc[t + 1] = np.clip(soc[t + 1], 0, config.capacity_kwh)
+
+    load_arr = actual_kw if actual_kw is not None else forecast_kw
+    return {
+        "success": True,
+        "prices":  forecast_prices,
+        "charge":  avg_charge,
+        "soc":     soc[:-1],
+        "grid_draw": np.maximum(0, forecast_kw + avg_charge),
+        "battery_capacity_kwh": config.capacity_kwh,
+        "cost_without": r_costs["cost_without"],
+        "cost_with":    r_costs["cost_with"],
+        "savings":      r_costs["savings"],
+        "savings_pct":  r_costs["savings_pct"],
+        **realized,
+        "realized_cost_without": r_costs["cost_without"],
+        "realized_cost_with":    r_costs["cost_with"],
+        "realized_savings":      r_costs["savings"],
+        "realized_savings_pct":  r_costs["savings_pct"],
+        "n_scenarios": len(charge_plans),
+    }
+
+
+RL_MODEL_PATH = Path(__file__).parent.parent / "outputs" / "rl_agent" / "policy_weights.npz"
+LOOKAHEAD = 3
+
+
+def _rl_obs(soc: float, t: int, prices: np.ndarray, loads: np.ndarray, capacity: float) -> np.ndarray:
+    n = len(prices)
+    soc_norm    = soc / capacity
+    price_win   = [prices[min(t + i, n - 1)] for i in range(LOOKAHEAD + 1)]
+    load_win    = [loads[min(t + i, n - 1)]  for i in range(LOOKAHEAD + 1)]
+    hour        = t % 24
+    return np.array(
+        [soc_norm]
+        + (np.array(price_win, dtype=np.float32) / 0.35).tolist()
+        + (np.array(load_win,  dtype=np.float32) / 5.0).tolist()
+        + [np.sin(2 * np.pi * hour / 24), np.cos(2 * np.pi * hour / 24)],
+        dtype=np.float32,
+    )
+
+
+def _rl_forward(obs: np.ndarray, weights: dict) -> float:
+    """Pure-numpy forward pass for PPO MlpPolicy (ReLU → ReLU → tanh)."""
+    x = obs
+    x = np.maximum(0, x @ weights["mlp_extractor.policy_net.0.weight"].T + weights["mlp_extractor.policy_net.0.bias"])
+    x = np.maximum(0, x @ weights["mlp_extractor.policy_net.2.weight"].T + weights["mlp_extractor.policy_net.2.bias"])
+    x = x @ weights["action_net.weight"].T + weights["action_net.bias"]
+    return float(np.tanh(x[0]))
+
+
+def optimize_battery_rl(forecast_kw: np.ndarray,
+                         forecast_prices: np.ndarray,
+                         actual_kw: np.ndarray | None = None,
+                         actual_prices: np.ndarray | None = None,
+                         config: BatteryConfig | None = None) -> dict:
+    """
+    RL dispatch using pure-numpy inference (no PyTorch needed at runtime).
+    The agent only observes current state + short lookahead — no future cheating.
+    """
+    if not RL_MODEL_PATH.exists():
+        return {"success": False, "message": "RL weights not found. Run: python src/train_rl_agent.py && python src/export_rl_weights.py"}
+
+    config          = config or DEFAULT_BATTERY_CONFIG
+    forecast_kw     = np.asarray(forecast_kw,     dtype=float)
+    forecast_prices = np.asarray(forecast_prices, dtype=float)
+
+    weights = dict(np.load(str(RL_MODEL_PATH)))
+
+    soc_arr    = np.zeros(len(forecast_kw) + 1)
+    charge_arr = np.zeros(len(forecast_kw))
+    grid_arr   = np.zeros(len(forecast_kw))
+    soc_arr[0] = config.capacity_kwh * config.initial_soc
+    soc        = soc_arr[0]
+
+    for t in range(len(forecast_kw)):
+        obs    = _rl_obs(soc, t, forecast_prices, forecast_kw, config.capacity_kwh)
+        action = _rl_forward(obs, weights)           # in [-1, 1]
+
+        load = float(forecast_kw[t])
+        if action >= 0:
+            desired = action * config.max_charge_rate_kw
+            actual  = min(desired, (config.capacity_kwh - soc) / config.charge_efficiency)
+            actual  = max(actual, 0.0)
+            soc    += actual * config.charge_efficiency
+            charge_arr[t] = actual
+        else:
+            desired = -action * config.max_discharge_rate_kw
+            actual  = min(desired, soc * config.discharge_efficiency, max(load, 0.0))
+            actual  = max(actual, 0.0)
+            soc    -= actual / config.discharge_efficiency
+            charge_arr[t] = -actual
+
+        soc = np.clip(soc, 0, config.capacity_kwh)
+        soc_arr[t + 1] = soc
+        grid_arr[t]    = max(load + charge_arr[t], 0.0)
+
+    realized = realize_schedule(actual_kw if actual_kw is not None else forecast_kw, charge_arr, config=config)
+    ap       = actual_prices if actual_prices is not None else forecast_prices
+    r_costs  = cost_summary(actual_kw if actual_kw is not None else forecast_kw, realized["realized_grid_draw"], np.asarray(ap, dtype=float))
+
+    return {
+        "success": True,
+        "prices":  forecast_prices,
+        "charge":  charge_arr,
+        "soc":     soc_arr[:-1],
+        "grid_draw": grid_arr,
+        "battery_capacity_kwh": config.capacity_kwh,
+        "cost_without": r_costs["cost_without"],
+        "cost_with":    r_costs["cost_with"],
+        "savings":      r_costs["savings"],
+        "savings_pct":  r_costs["savings_pct"],
+        **realized,
+        "realized_cost_without": r_costs["cost_without"],
+        "realized_cost_with":    r_costs["cost_with"],
+        "realized_savings":      r_costs["savings"],
+        "realized_savings_pct":  r_costs["savings_pct"],
+    }
+
+
 def plot_battery(forecast_kw, result, date_label="Sample Day", actual_kw=None):
     PLOTS_PATH.mkdir(parents=True, exist_ok=True)
     hours = np.arange(len(forecast_kw))

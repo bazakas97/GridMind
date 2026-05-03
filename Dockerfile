@@ -18,6 +18,7 @@ RUN pip install --upgrade pip && pip install -r /app/requirements-app.txt
 COPY app/ /app/app/
 COPY src/ /app/src/
 COPY outputs/metrics/ /app/outputs/metrics/
+COPY outputs/rl_agent/policy_weights.npz /app/outputs/rl_agent/policy_weights.npz
 
 EXPOSE 8501
 
